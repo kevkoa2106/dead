@@ -1,68 +1,118 @@
-use cargo_toml::{Dependency, Manifest};
-use std::collections::HashSet;
-use syn::{
-    ItemUse, UseTree,
-    visit::{self, Visit},
-};
+use cargo_toml::Manifest;
+use std::{collections::HashSet, env, fs};
+use syn::visit::{self, Visit};
+use walkdir::WalkDir;
 
-struct DependencyVisitor {
-    found_crates: HashSet<String>,
+struct UsageScanner {
+    referenced_crates: HashSet<String>,
 }
 
-impl<'ast> Visit<'ast> for DependencyVisitor {
-    // This function is called whenever the parser encounters a 'use' statement
-    fn visit_item_use(&mut self, i: &'ast ItemUse) {
-        self.extract_crate_from_tree(&i.tree);
-        // Continue walking the tree
+impl<'ast> Visit<'ast> for UsageScanner {
+    // 1. Catches: use crate_name::something;
+    fn visit_item_use(&mut self, i: &'ast syn::ItemUse) {
+        self.extract_from_use_tree(&i.tree);
         visit::visit_item_use(self, i);
+    }
+
+    // 2. Catches: crate_name::function();
+    fn visit_path(&mut self, i: &'ast syn::Path) {
+        if let Some(segment) = i.segments.first() {
+            self.referenced_crates.insert(segment.ident.to_string());
+        }
+        visit::visit_path(self, i);
+    }
+
+    // 3. Catches: #[derive(CrateName)] or #[serde(...)]
+    fn visit_attribute(&mut self, i: &'ast syn::Attribute) {
+        if let Some(segment) = i.path().segments.first() {
+            self.referenced_crates.insert(segment.ident.to_string());
+        }
+        visit::visit_attribute(self, i);
     }
 }
 
-impl DependencyVisitor {
-    fn extract_crate_from_tree(&mut self, tree: &UseTree) {
+impl UsageScanner {
+    fn extract_from_use_tree(&mut self, tree: &syn::UseTree) {
         match tree {
-            UseTree::Path(path) => {
-                // The first identifier in 'use serde::Deserialize' is 'serde'
-                self.found_crates.insert(path.ident.to_string());
+            syn::UseTree::Path(path) => {
+                self.referenced_crates.insert(path.ident.to_string());
             }
-            UseTree::Group(group) => {
-                // Handles 'use {a, b}'
-                for inner in &group.items {
-                    self.extract_crate_from_tree(inner);
+            syn::UseTree::Name(name) => {
+                self.referenced_crates.insert(name.ident.to_string());
+            }
+            syn::UseTree::Group(group) => {
+                for item in &group.items {
+                    self.extract_from_use_tree(item);
                 }
             }
-            _ => {}
+            syn::UseTree::Rename(rename) => {
+                self.referenced_crates.insert(rename.ident.to_string());
+            }
+            syn::UseTree::Glob(_) => {}
         }
     }
 }
 
 fn main() {
-    let code = std::fs::read_to_string(file!()).unwrap();
-    let toml = std::fs::read_to_string("Cargo.toml").expect("Failed to read Cargo.toml");
+    let current_dir = env::current_dir().unwrap();
+    let manifest_path = current_dir.join("Cargo.toml");
+    let src_path = current_dir.join("src");
 
-    let manifest = Manifest::from_str(&toml).expect("Failed to parse TOML");
+    if !manifest_path.exists() {
+        eprintln!("❌ No Cargo.toml found in {:?}", current_dir);
+        return;
+    }
 
-    let syntax_tree = syn::parse_file(code.as_str()).expect("Unable to parse file");
-    let mut visitor = DependencyVisitor {
-        found_crates: HashSet::new(),
-    };
+    let manifest = Manifest::from_path(&manifest_path).unwrap();
+    let declared_deps: HashSet<String> = manifest
+        .dependencies
+        .keys()
+        .map(|k| k.replace("-", "_")) // MUST normalize hyphens
+        .collect();
 
-    visitor.visit_file(&syntax_tree);
-
-    println!("Detected crates: {:?}", visitor.found_crates);
-
-    for (name, dep) in manifest.dependencies {
-        match dep {
-            Dependency::Simple(version) => {
-                println!("{}: version {}", name, version);
+    //Identify Local Modules (To avoid false positives)
+    let mut local_modules = HashSet::new();
+    if let Ok(entries) = fs::read_dir(&src_path) {
+        for entry in entries.flatten() {
+            if let Some(name) = entry.path().file_stem().and_then(|s| s.to_str()) {
+                local_modules.insert(name.to_string());
             }
-            Dependency::Detailed(details) => {
-                println!(
-                    "{}: detailed (version: {:?}, path: {:?})",
-                    name, details.version, details.features
-                );
-            }
-            _ => println!("{}: other dependency type", name),
         }
+    }
+
+    // Scan All Files
+    let mut scanner = UsageScanner {
+        referenced_crates: HashSet::new(),
+    };
+    for entry in WalkDir::new(&src_path).into_iter().flatten() {
+        if entry.path().extension().map_or(false, |ext| ext == "rs") {
+            let content = fs::read_to_string(entry.path()).unwrap_or_default();
+            if let Ok(file) = syn::parse_file(&content) {
+                scanner.visit_file(&file);
+            }
+        }
+    }
+
+    //Comparison
+    let ignored: HashSet<&str> = ["std", "core", "alloc", "crate", "self", "super"]
+        .into_iter()
+        .collect();
+
+    println!("Checking dependencies for: {}\n", current_dir.display());
+
+    let mut has_unused = false;
+    for dep in &declared_deps {
+        // A dep is unused if it's NOT in referenced_crates AND not a local module
+        if !scanner.referenced_crates.contains(dep)
+            && !local_modules.contains(dep)
+            && !ignored.contains(dep.as_str())
+        {
+            println!("⚠️  Possibly Unused: {}", dep);
+            has_unused = true;
+        }
+    }
+
+    if !has_unused {
+        println!("✅ Everything looks used!");
     }
 }

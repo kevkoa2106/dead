@@ -6,3 +6,4 @@ edition = "2024"
 [dependencies]
 syn = { version = "2.0", features = ["full", "visit"] }
 cargo_toml = "0.22.3"
+walkdir = "2.5.0"
